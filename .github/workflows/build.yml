@@ -1,0 +1,118 @@
+name: Build candyGram IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macOS 27 + Xcode 27.1, matching versions.json
+    runs-on: xcode-27
+    timeout-minutes: 360
+
+    steps:
+      - name: Check secrets
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          if [ -z "$API_ID" ] || [ -z "$API_HASH" ]; then
+            echo "::error::Set TELEGRAM_API_ID and TELEGRAM_API_HASH in Settings -> Secrets and variables -> Actions (get them at https://my.telegram.org/apps)"
+            exit 1
+          fi
+
+      - name: Free disk space
+        run: |
+          df -h /
+          # keep only the Xcode version this source needs
+          XCODE_KEEP="/Applications/Xcode_27.1.app"
+          for x in /Applications/Xcode_*.app; do
+            if [ "$x" != "$XCODE_KEEP" ] && [ ! -L "$x" ]; then sudo rm -rf "$x"; fi
+          done
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet ~/.dotnet ~/.ghcup /usr/local/lib/node_modules || true
+          xcrun simctl delete all || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: |
+          XCODE_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')
+          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Move source to canonical directory
+        run: |
+          # source paths end up in the binary, keep them stable across builds
+          sudo mkdir -p /Users/Shared
+          sudo chown "$(whoami)" /Users/Shared
+          mv "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
+          mkdir -p "$GITHUB_WORKSPACE"
+
+      - name: Write build configuration
+        working-directory: /Users/Shared/telegram-ios
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          cfg = json.load(open("build-system/candygram-configuration.json"))
+          cfg["api_id"] = os.environ["API_ID"].strip()
+          cfg["api_hash"] = os.environ["API_HASH"].strip()
+          json.dump(cfg, open("build-system/candygram-configuration.local.json", "w"), indent=2)
+          EOF
+
+      - name: Build the app
+        working-directory: /Users/Shared/telegram-ios
+        run: |
+          set -x
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+          APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')
+          BUILD_NUMBER="$(( $(git rev-list --count HEAD) + BUILD_NUMBER_OFFSET ))"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="/private/var/tmp/_bazel_containerhost" \
+            build \
+            --configurationPath="build-system/candygram-configuration.local.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+
+          mkdir -p build/artifacts
+          for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
+            cp "$f" build/artifacts/candyGram.ipa
+          done
+          ls -lh build/artifacts
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candyGram-${{ env.APP_VERSION }}-${{ env.BUILD_NUMBER }}
+          path: /Users/Shared/telegram-ios/build/artifacts/candyGram.ipa
+          retention-days: 14
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ env.BUILD_NUMBER }}
+          name: candyGram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
+          body: |
+            Unsigned candyGram build ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }}).
+            Install on iPhone with Sideloadly or AltStore (they sign it with your Apple ID).
+          files: /Users/Shared/telegram-ios/build/artifacts/candyGram.ipa
